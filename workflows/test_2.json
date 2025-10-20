@@ -1,0 +1,248 @@
+{
+    "name": "Graph Orchestrator – Fetch, Preview, Simulate & (Optionally) Callback",
+    "nodes": [
+      {
+        "parameters": {},
+        "id": "0a4e3497",
+        "name": "Manual Trigger",
+        "type": "n8n-nodes-base.manualTrigger",
+        "typeVersion": 1,
+        "position": [
+          -520,
+          260
+        ]
+      },
+      {
+        "parameters": {
+          "keepOnlySet": true,
+          "values": {
+            "string": [
+              {
+                "name": "backendBaseUrl",
+                "value": "http://localhost:8000"
+              },
+              {
+                "name": "graphId",
+                "value": "YOUR_GRAPH_ID"
+              },
+              {
+                "name": "actionId",
+                "value": "create_subgraph_skeleton"
+              },
+              {
+                "name": "taskId",
+                "value": "l1_skeleton"
+              },
+              {
+                "name": "webhookToken",
+                "value": ""
+              }
+            ],
+            "number": [
+              {
+                "name": "depth",
+                "value": 0
+              }
+            ],
+            "boolean": [
+              {
+                "name": "applyCallback",
+                "value": false
+              }
+            ]
+          },
+          "options": {}
+        },
+        "id": "7ea741ab",
+        "name": "Set Inputs",
+        "type": "n8n-nodes-base.set",
+        "typeVersion": 2,
+        "position": [
+          -310,
+          260
+        ]
+      },
+      {
+        "parameters": {
+          "authentication": "none",
+          "url": "={{$node[\"Set Inputs\"].json.backendBaseUrl}}/graphs/{{$node[\"Set Inputs\"].json.graphId}}/n8n/templates?action_id={{$node[\"Set Inputs\"].json.actionId}}&depth={{$node[\"Set Inputs\"].json.depth}}",
+          "responseFormat": "json",
+          "options": {}
+        },
+        "id": "31255ce0",
+        "name": "GET Templates",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4,
+        "position": [
+          -40,
+          140
+        ]
+      },
+      {
+        "parameters": {
+          "authentication": "none",
+          "url": "={{$node[\"Set Inputs\"].json.backendBaseUrl}}/graphs/{{$node[\"Set Inputs\"].json.graphId}}",
+          "responseFormat": "json",
+          "options": {}
+        },
+        "id": "91da07d3",
+        "name": "GET Graph",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4,
+        "position": [
+          -40,
+          390
+        ]
+      },
+      {
+        "parameters": {
+          "functionCode": "\n// Helpers\nfunction deepSubgraphs(doc, currentDepth=0, acc=[]) {\n  const subs = doc.subgraphs || {};\n  for (const [sgId, sg] of Object.entries(subs)) {\n    acc.push({ depth: currentDepth+1, sgId, doc: sg });\n    deepSubgraphs(sg, currentDepth+1, acc);\n  }\n  return acc;\n}\n\nfunction nodeDepthIndex(root) {\n  // Build a map: depth -> array of {nodeId, graphId}\n  const idx = new Map();\n  // depth 0, top-level nodes\n  const depth0 = (root.nodes || []).map(n => ({ nodeId: n.id, graphId: null }));\n  idx.set(0, depth0);\n  // recurse\n  const stack = [{ depth: 0, sgId: null, doc: root }];\n  while (stack.length) {\n    const { depth, doc } = stack.pop();\n    const subs = doc.subgraphs || {};\n    for (const [sgId, sg] of Object.entries(subs)) {\n      const nextDepth = depth + 1;\n      const arr = idx.get(nextDepth) || [];\n      for (const n of (sg.nodes || [])) {\n        arr.push({ nodeId: n.id, graphId: sgId });\n      }\n      idx.set(nextDepth, arr);\n      stack.push({ depth: nextDepth, sgId, doc: sg });\n    }\n  }\n  return idx;\n}\n\nfunction buildSkeletonForParent(graphDoc, parentId) {\n  // Build very small L1 skeleton:\n  // - controller node\n  // - one \"port_<edgeId>\" per incident top-level edge\n  // - edges: IN ports -> controller, controller -> OUT ports\n  const edgesTop = graphDoc.edges || [];\n  const nodesTop = graphDoc.nodes || [];\n  // incident edges\n  const incident = edgesTop.filter(e => e.source === parentId || e.target === parentId);\n  const nodes = [];\n  const edges = [];\n  // main controller\n  nodes.push({ tmp: \"controller\", type: \"process\", label: \"Controller\" });\n  for (const e of incident) {\n    const portTmp = `port_${e.id}`;\n    const isOutgoing = (e.source === parentId);\n    nodes.push({ tmp: portTmp, type: \"port\", label: isOutgoing ? `To ${e.target}` : `From ${e.source}` });\n    if (isOutgoing) {\n      edges.push({ source: \"controller\", target: portTmp });\n    } else {\n      edges.push({ source: portTmp, target: \"controller\" });\n    }\n  }\n  return { nodes, edges, incident };\n}\n\nconst inputs = $node[\"Set Inputs\"].json;\nconst actionId = inputs.actionId;\nconst depth = inputs.depth;\nconst graphId = inputs.graphId;\nconst taskId = inputs.taskId || (actionId === 'create_subgraph_skeleton' ? 'l1_skeleton' : 'fill_node');\nconst sessionId = `${Date.now()}`;\nconst jobId = `${Date.now()}`;\n\n// data from other nodes\nconst tmpl = $node[\"GET Templates\"].json || {};\nconst graphDoc = $node[\"GET Graph\"].json || {};\n\nconst templates = tmpl.templates || {};\nconst templateIds = Object.keys(templates);\n\n// Build depth index to resolve graphId for internal nodes (fill_fields case)\nconst dIndex = nodeDepthIndex(graphDoc);\nconst depthEntries = dIndex.get(depth) || [];\n// map nodeId -> graphId (first match if duplicates)\nconst nodeToGraph = new Map();\nfor (const ent of depthEntries) {\n  if (!nodeToGraph.has(ent.nodeId)) nodeToGraph.set(ent.nodeId, ent.graphId);\n}\n\nconst results = [];\n\nif (actionId === 'create_subgraph_skeleton') {\n  // L0 -> L1\n  // Build skeletons and pair inter-edge resolutions (one big batch)\n  const inter = [];\n  for (const parentId of templateIds) {\n    const sk = buildSkeletonForParent(graphDoc, parentId);\n    results.push({\n      nodeId: parentId,\n      meta: {\n        subgraph: {\n          nodes: sk.nodes,\n          edges: sk.edges\n        }\n      }\n    });\n  }\n  // Inter-edge resolutions: for all top-level edges, pair port_<edgeId> on both sides\n  for (const e of (graphDoc.edges || [])) {\n    inter.push({ parentEdgeId: e.id, sourceTmp: `port_${e.id}`, targetTmp: `port_${e.id}` });\n  }\n  if (results.length > 0) {\n    results[0].meta = results[0].meta || {};\n    results[0].meta.interEdgeResolution = inter;\n  }\n} else {\n  // fill_fields (e.g., L1 details)\n  for (const nodeId of templateIds) {\n    const gId = nodeToGraph.get(nodeId) || null;\n    results.push({\n      nodeId,\n      graphId: gId,\n      data: {\n        functionalDescription: `Description du module ${nodeId}.`,\n        // NOTE: 'inputs'/'outputs' arrays may require policy update on backend to be accepted.\n        // For MVP compatibility, we also set 'input'/'output' as string summaries.\n        inputs: [ \"Entrée X (source interne)\", \"Événement Y (externe via API)\" ],\n        outputs: [ \"Résultat Z (destination interne)\", \"Notification N (externe)\" ],\n        input: \"Entrées principales: X, Y\",\n        output: \"Sorties principales: Z, N\",\n        contracts: [ \"API REST /v1/example\", \"Topic kafka 'events.example'\" ],\n        macroErrorHandling: \"Retry 3x, DLQ si échec persistant, alerting si critique.\"\n      }\n    });\n  }\n}\n\nconst envelope = {\n  session_id: sessionId,\n  graph_id: graphId,\n  task_id: taskId,\n  job_id: jobId,\n  action_id: actionId,\n  results\n};\nreturn [{ json: envelope, pairedItem: { item: 0 } }];\n"
+        },
+        "id": "126de355",
+        "name": "Build Envelope (simulate)",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 2,
+        "position": [
+          220,
+          260
+        ]
+      },
+      {
+        "parameters": {
+          "conditions": {
+            "boolean": [
+              {
+                "value1": "={{$node[\"Set Inputs\"].json.applyCallback}}"
+              }
+            ]
+          }
+        },
+        "id": "2c22ffff",
+        "name": "IF Apply Callback?",
+        "type": "n8n-nodes-base.if",
+        "typeVersion": 2,
+        "position": [
+          460,
+          260
+        ]
+      },
+      {
+        "parameters": {
+          "authentication": "none",
+          "url": "={{$node[\"Set Inputs\"].json.backendBaseUrl}}/graphs/{{$node[\"Set Inputs\"].json.graphId}}/n8n-callback",
+          "options": {
+            "headerParametersJson": "={ \"X-Webhook-Token\": $node[\"Set Inputs\"].json.webhookToken, \"Idempotency-Key\": $json.job_id }"
+          },
+          "jsonParameters": true,
+          "sendBody": true,
+          "responseFormat": "json",
+          "bodyParametersJson": "={{$json}}"
+        },
+        "id": "547c46a1",
+        "name": "POST Callback",
+        "type": "n8n-nodes-base.httpRequest",
+        "typeVersion": 4,
+        "position": [
+          700,
+          220
+        ]
+      },
+      {
+        "parameters": {
+          "functionCode": "return [{ json: { note: 'Simulation preview only (no callback).', envelope: $json } }];"
+        },
+        "id": "b8ccd552",
+        "name": "Preview Envelope",
+        "type": "n8n-nodes-base.function",
+        "typeVersion": 2,
+        "position": [
+          700,
+          340
+        ]
+      }
+    ],
+    "connections": {
+      "Manual Trigger": {
+        "main": [
+          [
+            {
+              "node": "Set Inputs",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Set Inputs": {
+        "main": [
+          [
+            {
+              "node": "GET Templates",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "GET Templates": {
+        "main": [
+          [
+            {
+              "node": "GET Graph",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "GET Graph": {
+        "main": [
+          [
+            {
+              "node": "Build Envelope (simulate)",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "Build Envelope (simulate)": {
+        "main": [
+          [
+            {
+              "node": "IF Apply Callback?",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      },
+      "IF Apply Callback?": {
+        "main": [
+          [
+            {
+              "node": "POST Callback",
+              "type": "main",
+              "index": 0
+            }
+          ],
+          [
+            {
+              "node": "Preview Envelope",
+              "type": "main",
+              "index": 0
+            }
+          ]
+        ]
+      }
+    },
+    "pinData": {},
+    "settings": {
+      "executionOrder": "v1"
+    },
+    "staticData": null,
+    "meta": {
+      "templateCredsSetup": []
+    },
+    "id": 1760885853
+  }
